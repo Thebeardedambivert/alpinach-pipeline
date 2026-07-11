@@ -1,0 +1,7 @@
+# Normalize line endings. Keep source files LF in the repo regardless of OS.
+* text=auto eol=lf
+
+*.ts   text eol=lf
+*.sql  text eol=lf
+*.json text eol=lf
+*.md   text eol=lf
