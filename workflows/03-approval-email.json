@@ -1,0 +1,130 @@
+{
+  "name": "03 approval-email",
+  "nodes": [
+    {
+      "id": "trigger",
+      "name": "When Called",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.1,
+      "position": [0, 0],
+      "parameters": {
+        "inputSource": "workflowInputs",
+        "workflowInputs": {
+          "values": [{ "name": "property_id", "type": "string" }]
+        }
+      }
+    },
+    {
+      "id": "issue-token",
+      "name": "Issue Token",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [220, 0],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "select public.issue_approval_token($1::uuid, 48) as token;",
+        "options": {
+          "queryReplacement": "={{ $json.property_id }}"
+        }
+      },
+      "credentials": {
+        "postgres": { "id": "REPLACE_WITH_POSTGRES_CREDENTIAL_ID", "name": "Supabase (n8n_worker)" }
+      },
+      "notes": "Returns the RAW token (uuid) and stores only its SHA-256 hash on properties. Returns NULL when the property has zero pending_approval posts (nothing to approve) or does not exist. The function ALSO sets properties.status='ready' and clears approved_at/approved_by_ip atomically — so this workflow does NOT update status separately. The raw token in this node's output is why saveDataSuccessExecution=none is pinned on this workflow specifically."
+    },
+    {
+      "id": "token-issued",
+      "name": "Token Issued?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [440, 0],
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "version": 2 },
+          "combinator": "and",
+          "conditions": [
+            {
+              "operator": { "type": "string", "operation": "notEmpty", "singleValue": true },
+              "leftValue": "={{ $json.token }}",
+              "rightValue": ""
+            }
+          ]
+        }
+      },
+      "notes": "The function returns one row with token=null when there is nothing to approve. Guard on the VALUE being non-empty, not on row count — the Postgres node returns a row either way. False branch stops silently: no pending posts is a normal state, not an error."
+    },
+    {
+      "id": "load",
+      "name": "Load Property + Posts",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [660, -20],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "select\n  p.title,\n  p.municipality,\n  p.canton,\n  p.rooms,\n  p.living_area_m2,\n  p.price,\n  a.full_name as agent_name,\n  a.email     as agent_email,\n  coalesce(a.locale, p.locale, 'de-CH') as locale,\n  (\n    select jsonb_agg(\n             jsonb_build_object('platform', po.platform, 'caption', po.caption)\n             order by po.platform\n           )\n      from public.posts po\n     where po.property_id = p.id\n       and po.status = 'pending_approval'\n  ) as posts\nfrom public.properties p\njoin public.agents a on a.id = p.agent_id\nwhere p.id = $1::uuid;",
+        "options": {
+          "queryReplacement": "={{ $('When Called').item.json.property_id }}"
+        }
+      },
+      "credentials": {
+        "postgres": { "id": "REPLACE_WITH_POSTGRES_CREDENTIAL_ID", "name": "Supabase (n8n_worker)" }
+      },
+      "notes": "property_id is pulled from the trigger, not from the previous node — the IF branch only carries { token }, not property_id. n8n_worker has SELECT on properties, posts, and agents. Fetches the agent's email as the recipient and every pending caption for the body."
+    },
+    {
+      "id": "build-email",
+      "name": "Build Email Body",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [880, -20],
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Assembles the caption list for the email. This node DELIBERATELY never\n// touches the approval token — the raw token is injected only at the Resend\n// node, direct from Issue Token. Keeping it out of here honours the design\n// rule: the token exists in exactly two places, the Postgres response and the\n// email body, and never in a Code node output.\n\nconst p = $input.item.json;\nconst posts = Array.isArray(p.posts) ? p.posts : [];\n\nconst LABEL = { instagram: 'Instagram', facebook: 'Facebook', linkedin: 'LinkedIn', tiktok: 'TikTok' };\n\nconst esc = (s) => String(s ?? '')\n  .replace(/&/g, '&amp;')\n  .replace(/</g, '&lt;')\n  .replace(/>/g, '&gt;');\n\nconst propertyLabel =\n  [p.title, p.municipality, p.canton].filter(Boolean).join(', ') || 'Ihre Immobilie';\n\nconst postsHtml = posts.map((po) => `\n  <div style=\"border:1px solid #e5e5e5;border-radius:8px;padding:16px;margin:0 0 16px;\">\n    <div style=\"font-weight:600;font-size:13px;letter-spacing:0.02em;text-transform:uppercase;color:#6b6b6b;margin-bottom:8px;\">${esc(LABEL[po.platform] || po.platform)}</div>\n    <div style=\"white-space:pre-wrap;font-size:14px;line-height:1.55;color:#222;\">${esc(po.caption)}</div>\n  </div>`).join('');\n\nconst n = posts.length;\nconst subject = `${n} Caption${n === 1 ? '' : 's'} bereit zur Freigabe \\u2013 ${propertyLabel}`;\n\nreturn { json: {\n  agent_email: p.agent_email,\n  agent_name: p.agent_name || '',\n  property_label: propertyLabel,\n  post_count: n,\n  posts_html: postsHtml,\n  subject\n} };"
+      }
+    },
+    {
+      "id": "send-email",
+      "name": "Send Approval Email",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1100, -20],
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.resend.com/emails",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ (() => {\n  const BASE = 'https://supabase.alpinach.com/functions/v1/REPLACE_WITH_APPROVAL_FUNCTION';\n  const token = $('Issue Token').item.json.token;\n  const approveUrl = BASE + '/approve?token=' + token;\n  const rejectUrl  = BASE + '/reject?token=' + token;\n  const greeting = $json.agent_name ? ('Guten Tag ' + $json.agent_name) : 'Guten Tag';\n  const html = `<!doctype html><html><body style=\"margin:0;padding:0;background:#f4f4f5;\">\n  <div style=\"max-width:600px;margin:0 auto;padding:32px 24px;font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;\">\n    <h1 style=\"font-size:20px;color:#111;margin:0 0 8px;\">${greeting},</h1>\n    <p style=\"font-size:15px;line-height:1.55;color:#444;margin:0 0 24px;\">Ihre ${$json.post_count} Caption${$json.post_count === 1 ? '' : 's'} f\\u00fcr <strong>${$json.property_label}</strong> sind bereit. Bitte pr\\u00fcfen Sie den Text und geben Sie ihn frei oder fordern Sie eine \\u00dcberarbeitung an.</p>\n    ${$json.posts_html}\n    <div style=\"margin:28px 0 8px;\">\n      <a href=\"${approveUrl}\" style=\"display:inline-block;background:#111;color:#fff;text-decoration:none;font-size:15px;font-weight:600;padding:14px 28px;border-radius:8px;\">Alle freigeben</a>\n      <a href=\"${rejectUrl}\" style=\"display:inline-block;margin-left:12px;background:#fff;color:#111;text-decoration:none;font-size:15px;font-weight:600;padding:14px 28px;border-radius:8px;border:1px solid #d4d4d8;\">Ablehnen / \\u00dcberarbeiten</a>\n    </div>\n    <p style=\"font-size:13px;line-height:1.5;color:#8a8a8a;margin:24px 0 0;\">Dieser Link ist 48 Stunden g\\u00fcltig und kann nur einmal verwendet werden. Wenn Sie diese Anfrage nicht erwartet haben, ignorieren Sie diese E-Mail.</p>\n  </div>\n</body></html>`;\n  return JSON.stringify({\n    from: 'Alpinach <approvals@alpinach.com>',\n    to: [$json.agent_email],\n    subject: $json.subject,\n    html\n  });\n})() }}",
+        "options": { "timeout": 15000 }
+      },
+      "credentials": {
+        "httpHeaderAuth": { "id": "REPLACE_WITH_RESEND_CREDENTIAL_ID", "name": "Resend API" }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "notes": "The raw token is pulled directly from Issue Token here and interpolated into the Approve/Reject URLs — it never passed through a Set or Code node. BASE points at the 04 Edge Function, which is not built yet: REPLACE_WITH_APPROVAL_FUNCTION is a placeholder. The links are GET URLs; 04 MUST render a confirmation page on GET and mutate only on POST, or mail-scanner prefetch publishes everything on delivery. Recipient is the agent's own email."
+    }
+  ],
+  "connections": {
+    "When Called": { "main": [[{ "node": "Issue Token", "type": "main", "index": 0 }]] },
+    "Issue Token": { "main": [[{ "node": "Token Issued?", "type": "main", "index": 0 }]] },
+    "Token Issued?": {
+      "main": [
+        [{ "node": "Load Property + Posts", "type": "main", "index": 0 }],
+        []
+      ]
+    },
+    "Load Property + Posts": { "main": [[{ "node": "Build Email Body", "type": "main", "index": 0 }]] },
+    "Build Email Body": { "main": [[{ "node": "Send Approval Email", "type": "main", "index": 0 }]] }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataSuccessExecution": "none",
+    "saveDataErrorExecution": "all",
+    "executionTimeout": 120,
+    "errorWorkflow": "REPLACE_WITH_ERROR_HANDLER_WORKFLOW_ID"
+  },
+  "pinData": {}
+}

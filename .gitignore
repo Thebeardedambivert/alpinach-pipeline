@@ -1,0 +1,9 @@
+.env
+.env.*
+*.key
+n8n-config.json
+*credentials*.json
+*.dump
+*.sql.gz
+.DS_Store
+node_modules/
